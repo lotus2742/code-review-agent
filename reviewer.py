@@ -61,7 +61,7 @@ def parse_pr_url(pr_url: str) -> tuple[str, str, int]:
     owner = parts[-4]
     return owner, repo, pr_number
 
-
+# test & test
 def github_api(path: str, accept: str = "application/vnd.github.v3+json") -> bytes:
     token = os.getenv("GITHUB_TOKEN", "")
     req = urllib.request.Request(
