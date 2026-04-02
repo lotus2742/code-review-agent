@@ -1,0 +1,71 @@
+name: "AI Code Review Agent"
+description: "基于 RAG + LLM 的自动 Code Review，检索团队编码规范后对 PR Diff 进行结构化分析，并将结果发回 PR 评论"
+author: "lotus2742"
+
+branding:
+  icon: "code"
+  color: "blue"
+
+inputs:
+  openai_api_key:
+    description: "OpenAI 兼容接口的 API Key"
+    required: true
+  openai_api_base:
+    description: "OpenAI 兼容接口的 Base URL（支持 qwen、DeepSeek、OpenAI 等）"
+    required: true
+  openai_model:
+    description: "使用的模型名称，如 gpt-4o、qwen-turbo"
+    required: true
+  github_token:
+    description: "GitHub Token，用于发回 PR 评论（需要 pull-requests: write 权限）"
+    required: true
+    default: ${{ github.token }}
+  pr_url:
+    description: "PR 的完整 URL，默认自动读取当前触发的 PR"
+    required: false
+    default: ${{ github.event.pull_request.html_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-code-review-agent-${{ hashFiles(format('{0}/requirements.txt', github.action_path)) }}
+        restore-keys: |
+          ${{ runner.os }}-pip-code-review-agent-
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Cache embedding model
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-hf-bge-small-zh-v1.5
+
+    - name: Build RAG index
+      shell: bash
+      run: python ${{ github.action_path }}/reviewer.py --build-index
+      env:
+        OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+        OPENAI_API_BASE: ${{ inputs.openai_api_base }}
+        OPENAI_MODEL: ${{ inputs.openai_model }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+
+    - name: Run AI Code Review
+      shell: bash
+      run: python ${{ github.action_path }}/reviewer.py "${{ inputs.pr_url }}" --post
+      env:
+        OPENAI_API_KEY: ${{ inputs.openai_api_key }}
+        OPENAI_API_BASE: ${{ inputs.openai_api_base }}
+        OPENAI_MODEL: ${{ inputs.openai_model }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+

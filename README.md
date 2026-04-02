@@ -97,6 +97,40 @@ python reviewer.py https://github.com/owner/repo/pull/123 --post
 
 可以直接修改或新增 `.md` 文件来扩展规范库，然后重建索引即可生效。
 
+## 在其他项目中接入
+
+无需复制代码，直接在目标项目的 workflow 中引用本仓库即可自动 review 每一个 PR。
+
+在目标项目中创建 `.github/workflows/code-review.yml`：
+
+```yaml
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.actor != 'dependabot[bot]'
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lotus2742/code-review-agent@main
+        with:
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          openai_api_base: ${{ secrets.OPENAI_API_BASE }}
+          openai_model: ${{ secrets.OPENAI_MODEL }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+然后在目标项目的 **Settings → Secrets → Actions** 中配置 `OPENAI_API_KEY`、`OPENAI_API_BASE`、`OPENAI_MODEL` 即可。PR 创建或更新时会自动触发，review 结果以评论形式出现在 PR 页面。
+
+> 如需使用自定义规范文档，fork 本仓库并修改 `docs/` 目录后，将 `uses` 指向你的 fork 即可。
+
 ## 注意事项
 
 - `.env` 文件包含敏感信息，已在 `.gitignore` 中排除，**请勿提交到 git**
