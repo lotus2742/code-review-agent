@@ -5,11 +5,14 @@
 """
 
 import argparse
-import os
 import json
+import logging
 import pathlib
+import sys
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
+
 from dotenv import load_dotenv
 from openai import OpenAI
 from rag import retrieve, build_query_from_diff, build_index, index_exists
@@ -17,11 +20,51 @@ from rag import retrieve, build_query_from_diff, build_index, index_exists
 load_dotenv()
 
 
+# ---- 日志配置 ----
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",   # 终端友好：只输出消息本身，不带 level 前缀
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
+
+
+# ---- 集中管理环境变量 ----
+
+@dataclass
+class Settings:
+    openai_api_key: str
+    openai_api_base: str
+    openai_model: str
+    github_token: str
+
+    @classmethod
+    def load(cls) -> "Settings":
+        import os
+        missing = []
+        for key in ("OPENAI_API_KEY", "OPENAI_API_BASE", "OPENAI_MODEL"):
+            if not os.getenv(key):
+                missing.append(key)
+        if missing:
+            logger.error("缺少必要环境变量：%s，请检查 .env 文件", ", ".join(missing))
+            sys.exit(1)
+        return cls(
+            openai_api_key=os.environ["OPENAI_API_KEY"],
+            openai_api_base=os.environ["OPENAI_API_BASE"],
+            openai_model=os.environ["OPENAI_MODEL"],
+            github_token=os.getenv("GITHUB_TOKEN", ""),
+        )
+
+
+settings = Settings.load()
+
+
 # ---- LLM 配置 ----
 
 # 美团内部可选配置，外部用户不需要此文件，函数会静默返回空 dict
-def get_extra_headers():
-    cfg_path = pathlib.Path(os.path.expanduser("~/.openclaw/openclaw.json"))
+def get_extra_headers() -> dict:
+    cfg_path = pathlib.Path.home() / ".openclaw" / "openclaw.json"
     if cfg_path.exists():
         cfg = json.loads(cfg_path.read_text())
         return cfg.get("models", {}).get("providers", {}).get("kubeplex-maas", {}).get("headers", {})
@@ -30,12 +73,12 @@ def get_extra_headers():
 
 def call_llm(messages: list) -> str:
     client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_API_BASE"),
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_api_base,
     )
     full_content = ""
     stream = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL"),
+        model=settings.openai_model,
         messages=messages,
         temperature=0.1,
         stream=True,
@@ -45,7 +88,7 @@ def call_llm(messages: list) -> str:
         delta = chunk.choices[0].delta
         if delta.content:
             full_content += delta.content
-            print(delta.content, end="", flush=True)
+            print(delta.content, end="", flush=True)   # 流式输出保留 print，体验更好
     print()
     return full_content
 
@@ -61,15 +104,14 @@ def parse_pr_url(pr_url: str) -> tuple[str, str, int]:
     owner = parts[-4]
     return owner, repo, pr_number
 
-# test & test
+
 def github_api(path: str, accept: str = "application/vnd.github.v3+json") -> bytes:
-    token = os.getenv("GITHUB_TOKEN", "")
     req = urllib.request.Request(
         f"https://api.github.com{path}",
         headers={
             "Accept": accept,
             "User-Agent": "code-review-agent/1.0",
-            **({"Authorization": f"Bearer {token}"} if token else {}),
+            **({"Authorization": f"Bearer {settings.github_token}"} if settings.github_token else {}),
         }
     )
     with urllib.request.urlopen(req) as resp:
@@ -89,10 +131,9 @@ def get_pr_diff(owner: str, repo: str, pr_number: int) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
-    token = os.getenv("GITHUB_TOKEN", "")
-    if not token:
-        print("⚠️  未配置 GITHUB_TOKEN，无法发评论（只读模式）")
+def post_pr_comment(owner: str, repo: str, pr_number: int, body: str) -> None:
+    if not settings.github_token:
+        logger.warning("⚠️  未配置 GITHUB_TOKEN，无法发评论（只读模式）")
         return
     payload = json.dumps({"body": body}).encode()
     req = urllib.request.Request(
@@ -101,7 +142,7 @@ def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
         method="POST",
         headers={
             "Accept": "application/vnd.github.v3+json",
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {settings.github_token}",
             "Content-Type": "application/json",
             "User-Agent": "code-review-agent/1.0",
         }
@@ -109,9 +150,9 @@ def post_pr_comment(owner: str, repo: str, pr_number: int, body: str):
     try:
         with urllib.request.urlopen(req) as resp:
             result = json.loads(resp.read())
-            print(f"✅ 评论已发送: {result['html_url']}")
+            logger.info("✅ 评论已发送: %s", result["html_url"])
     except urllib.error.HTTPError as e:
-        print(f"❌ 发评论失败: {e.code} {e.reason}")
+        logger.error("❌ 发评论失败: %s %s", e.code, e.reason)
 
 
 # ---- Prompt ----
@@ -147,7 +188,7 @@ def review_diff(diff_content: str, pr_info: dict) -> dict:
     if len(diff_content) > max_chars:
         # 按文件边界截断，避免在文件中间断开
         files = []
-        current_file_lines = []
+        current_file_lines: list[str] = []
         for line in diff_content.split("\n"):
             if line.startswith("diff --git") and current_file_lines:
                 files.append("\n".join(current_file_lines))
@@ -163,12 +204,12 @@ def review_diff(diff_content: str, pr_info: dict) -> dict:
                 kept.append(f)
                 total += len(f)
             else:
-                # 提取文件名用于提示
                 first_line = f.split("\n")[0]
                 skipped.append(first_line.replace("diff --git ", "").split(" b/")[-1])
         diff_content = "\n".join(kept)
         if skipped:
             diff_content += f"\n\n[... 以下文件因 diff 过大已省略：{', '.join(skipped)} ...]"
+            logger.warning("⚠️  以下文件因 diff 过大已跳过：%s", ", ".join(skipped))
 
     pr_context = f"PR #{pr_info['number']}: {pr_info['title']}\n作者: {pr_info['user']['login']}\n描述: {pr_info.get('body') or '无'}"
 
@@ -181,18 +222,18 @@ def review_diff(diff_content: str, pr_info: dict) -> dict:
             if relevant_standards:
                 standards_text = "\n\n---\n\n".join(relevant_standards)
                 rag_context = f"\n\n## 本次变更涉及的相关编码规范\n\n{standards_text}\n"
-                print(f"📚 检索到 {len(relevant_standards)} 条相关规范片段")
+                logger.info("📚 检索到 %d 条相关规范片段", len(relevant_standards))
         else:
-            print("提示：未检测到规范索引，运行 `python reviewer.py --build-index` 可建立索引以启用规范检索")
+            logger.info("提示：未检测到规范索引，运行 `python reviewer.py --build-index` 可建立索引以启用规范检索")
     except Exception as e:
-        print(f"RAG 检索异常（已跳过）: {e}")
+        logger.warning("RAG 检索异常（已跳过）: %s", e)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": f"{pr_context}{rag_context}\n\n代码变更 Diff：\n\n{diff_content}"}
     ]
 
-    print("🤖 LLM 分析中...\n")
+    logger.info("🤖 LLM 分析中...\n")
     raw = call_llm(messages).strip()
     # 提取最外层 JSON 对象
     start = raw.find("{")
@@ -202,14 +243,14 @@ def review_diff(diff_content: str, pr_info: dict) -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"\n❌ LLM 返回内容无法解析为 JSON：{e}")
-        print(f"原始输出：\n{raw}")
+        logger.error("❌ LLM 返回内容无法解析为 JSON：%s", e)
+        logger.debug("原始输出：\n%s", raw)
         raise ValueError("LLM 未返回有效 JSON，请重试或检查 prompt") from e
 
 
 # ---- 格式化输出 ----
 
-def print_review(result: dict):
+def print_review(result: dict) -> None:
     severity_emoji = {"error": "🔴", "warning": "🟡", "suggestion": "🟢"}
     print("\n" + "=" * 60)
     print(f"📊 评分：{result['score']}/10")
@@ -263,17 +304,18 @@ def format_review_comment(result: dict, pr_url: str) -> str:
 
 # ---- 主流程 ----
 
-def review_pr(pr_url: str, post_to_pr: bool = False):
-    print(f"🚀 开始 Review PR: {pr_url}\n")
+def review_pr(pr_url: str, post_to_pr: bool = False) -> dict:
+    logger.info("🚀 开始 Review PR: %s\n", pr_url)
 
     owner, repo, pr_number = parse_pr_url(pr_url)
-    print(f"📦 仓库: {owner}/{repo}  PR: #{pr_number}\n")
+    logger.info("📦 仓库: %s/%s  PR: #%d\n", owner, repo, pr_number)
 
     # 1. 拿 PR 信息
     pr_info = get_pr_info(owner, repo, pr_number)
-    print(f"📋 标题: {pr_info['title']}")
-    print(f"👤 作者: {pr_info['user']['login']}")
-    print(f"📁 变更文件: {pr_info['changed_files']}  +{pr_info['additions']} -{pr_info['deletions']}\n")
+    logger.info("📋 标题: %s", pr_info["title"])
+    logger.info("👤 作者: %s", pr_info["user"]["login"])
+    logger.info("📁 变更文件: %d  +%d -%d\n",
+                pr_info["changed_files"], pr_info["additions"], pr_info["deletions"])
 
     # 2. 拉 Diff（过滤 lock 文件）
     diff = get_pr_diff(owner, repo, pr_number)
@@ -294,7 +336,7 @@ def review_pr(pr_url: str, post_to_pr: bool = False):
     # 4. 可选：发回 PR 评论（需要 GITHUB_TOKEN）
     if post_to_pr:
         comment = format_review_comment(result, pr_url)
-        print("\n📤 发送评论到 PR...")
+        logger.info("\n📤 发送评论到 PR...")
         post_pr_comment(owner, repo, pr_number, comment)
 
     return result
@@ -310,8 +352,8 @@ if __name__ == "__main__":
     if args.build_index:
         docs_dir = pathlib.Path(__file__).parent / "docs"
         total = build_index(docs_dir)
-        print(f"共索引 {total} 个规范 chunk，可开始使用规范检索功能")
-        exit(0)
+        logger.info("共索引 %d 个规范 chunk，可开始使用规范检索功能", total)
+        sys.exit(0)
 
     pr_url = args.pr_url
     if not pr_url:
@@ -327,6 +369,5 @@ if __name__ == "__main__":
         if answer == "y":
             owner, repo, pr_number = parse_pr_url(pr_url)
             comment = format_review_comment(result, pr_url)
-            print("\n📤 发送评论到 PR...")
+            logger.info("\n📤 发送评论到 PR...")
             post_pr_comment(owner, repo, pr_number, comment)
-# trigger GitHub Actions CI

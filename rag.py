@@ -6,7 +6,7 @@ RAG 模块：规范文档向量化检索
 - index_exists():        检测索引是否已建立
 """
 
-import os
+import logging
 import re
 import pathlib
 from typing import Optional
@@ -14,6 +14,8 @@ from typing import Optional
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+
+logger = logging.getLogger(__name__)
 
 # ---- 配置 ----
 
@@ -29,7 +31,7 @@ _chroma_client: Optional[chromadb.PersistentClient] = None
 def _get_embedding_model() -> SentenceTransformer:
     global _embedding_model
     if _embedding_model is None:
-        print("加载 Embedding 模型（首次需下载约 95MB）...")
+        logger.info("加载 Embedding 模型（首次需下载约 95MB）...")
         _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
     return _embedding_model
 
@@ -118,15 +120,15 @@ def build_index(docs_dir: str | pathlib.Path) -> int:
     if not md_files:
         raise ValueError(f"在 {docs_dir} 下未找到任何 .md 文件")
 
-    print(f"找到 {len(md_files)} 个规范文档，开始构建索引...")
+    logger.info("找到 %d 个规范文档，开始构建索引...", len(md_files))
 
     all_chunks = []
     for md_file in md_files:
         chunks = _load_and_chunk(md_file)
         all_chunks.extend(chunks)
-        print(f"  {md_file.name}: {len(chunks)} 个 chunk")
+        logger.info("  %s: %d 个 chunk", md_file.name, len(chunks))
 
-    print(f"共 {len(all_chunks)} 个 chunk，开始 embedding（首次较慢）...")
+    logger.info("共 %d 个 chunk，开始 embedding（首次较慢）...", len(all_chunks))
 
     client = _get_chroma_client()
     embedding_fn = _LocalEmbeddingFunction()
@@ -151,7 +153,7 @@ def build_index(docs_dir: str | pathlib.Path) -> int:
             metadatas=[c["metadata"] for c in batch],
         )
 
-    print(f"✅ 索引构建完成，共写入 {len(all_chunks)} 个 chunk")
+    logger.info("✅ 索引构建完成，共写入 %d 个 chunk", len(all_chunks))
     return len(all_chunks)
 
 
