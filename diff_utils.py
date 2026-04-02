@@ -3,6 +3,8 @@ Diff 处理与 Review 逻辑模块
 - filter_lock_files:        过滤 lock 文件
 - split_diff_into_files:    按文件拆分 diff
 - split_diff_into_shards:   按字符上限分片
+- parse_diff_to_structured: 将原始 diff 解析为结构化对象列表
+- render_structured_diff:   将结构化对象渲染为 LLM 友好的文本
 - review_single_shard:      单片 review（调用 LLM + RAG）
 - merge_review_results:     合并多片 review 结果
 - review_diff:              对外暴露的完整 review 入口
@@ -11,6 +13,8 @@ Diff 处理与 Review 逻辑模块
 import json
 import logging
 import re
+from dataclasses import dataclass, field
+from typing import Literal
 
 from llm_client import Settings, call_llm
 from prompts import SYSTEM_PROMPT
@@ -20,6 +24,46 @@ logger = logging.getLogger(__name__)
 
 # 需要跳过 review 的 lock 文件
 _LOCK_FILE_PATTERNS = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "go.sum"]
+
+
+# ---------------------------------------------------------------------------
+# 结构化 Diff 数据模型
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HunkLine:
+    """Hunk 中的单行，保留原始顺序"""
+    kind: Literal["added", "removed", "context"]   # added=新增, removed=删除, context=上下文
+    content: str                                    # 行内容（不含前缀 +/-/空格）
+
+
+@dataclass
+class Hunk:
+    """一个变更块（@@...@@），按原始顺序保留所有行"""
+    new_start: int                                  # 新文件起始行号
+    lines: list[HunkLine] = field(default_factory=list)
+
+    # 便捷属性
+    @property
+    def added_lines(self) -> list[str]:
+        return [l.content for l in self.lines if l.kind == "added"]
+
+    @property
+    def removed_lines(self) -> list[str]:
+        return [l.content for l in self.lines if l.kind == "removed"]
+
+    @property
+    def has_changes(self) -> bool:
+        return any(l.kind != "context" for l in self.lines)
+
+
+@dataclass
+class FileDiff:
+    """单个文件的变更摘要"""
+    filename: str
+    change_type: Literal["added", "deleted", "modified", "renamed"]
+    old_filename: str | None                                     # rename 时的旧文件名
+    hunks: list[Hunk] = field(default_factory=list)
 
 
 def filter_lock_files(diff: str) -> str:
@@ -80,6 +124,125 @@ def split_diff_into_shards(diff_content: str, max_chars: int) -> tuple[list[str]
     return shards, skipped_files
 
 
+# ---------------------------------------------------------------------------
+# Diff 解析 & 渲染
+# ---------------------------------------------------------------------------
+
+def parse_diff_to_structured(diff_content: str) -> list[FileDiff]:
+    """将原始 unified diff 解析为 FileDiff 结构化对象列表。"""
+    file_diffs: list[FileDiff] = []
+    current_file: FileDiff | None = None
+    current_hunk: Hunk | None = None
+
+    for line in diff_content.split("\n"):
+        # 文件头：diff --git a/xxx b/yyy
+        if line.startswith("diff --git "):
+            if current_hunk is not None and current_file is not None:
+                current_file.hunks.append(current_hunk)
+                current_hunk = None
+            if current_file is not None:
+                file_diffs.append(current_file)
+            m = re.search(r"diff --git a/(.+) b/(.+)", line)
+            if m:
+                current_file = FileDiff(
+                    filename=m.group(2),
+                    change_type="modified",
+                    old_filename=None,
+                )
+            continue
+
+        if current_file is None:
+            continue
+
+        # 文件状态标记
+        if line.startswith("new file mode"):
+            current_file.change_type = "added"
+        elif line.startswith("deleted file mode"):
+            current_file.change_type = "deleted"
+        elif line.startswith("rename from "):
+            current_file.old_filename = line[len("rename from "):]
+            current_file.change_type = "renamed"
+        elif line.startswith("rename to "):
+            current_file.filename = line[len("rename to "):]
+
+        # hunk 头：@@ -a,b +c,d @@
+        elif line.startswith("@@"):
+            if current_hunk is not None:
+                current_file.hunks.append(current_hunk)
+            m = re.search(r"\+([0-9]+)", line)
+            current_hunk = Hunk(new_start=int(m.group(1)) if m else 0)
+
+        # 变更行
+        elif current_hunk is not None:
+            if line.startswith("+") and not line.startswith("+++"):
+                current_hunk.lines.append(HunkLine(kind="added", content=line[1:]))
+            elif line.startswith("-") and not line.startswith("---"):
+                current_hunk.lines.append(HunkLine(kind="removed", content=line[1:]))
+            elif line.startswith(" "):
+                current_hunk.lines.append(HunkLine(kind="context", content=line[1:]))
+
+    # 收尾
+    if current_hunk is not None and current_file is not None:
+        current_file.hunks.append(current_hunk)
+    if current_file is not None:
+        file_diffs.append(current_file)
+
+    return file_diffs
+
+
+def render_structured_diff(file_diffs: list[FileDiff]) -> str:
+    """将结构化 FileDiff 列表渲染为 LLM 友好的文本。
+
+    设计原则：
+    - 所有行按原始顺序交织展示在同一代码块内，保证 LLM 能理解完整上下文
+    - 新增行（+ 行）：正常显示，行尾加 [NEW] 标记，是 review 对象
+    - 删除行（- 行）：行首加 // [DELETED] 注释，明确标注"仅供理解上下文，不参与评审"
+    - 上下文行（空格行）：正常显示，无标记
+    """
+    _CHANGE_LABEL = {
+        "added": "新增文件", "deleted": "已删除文件",
+        "modified": "已修改",  "renamed": "已重命名",
+    }
+    _EXT_LANG = {
+        "ts": "ts", "tsx": "tsx", "js": "js", "jsx": "jsx",
+        "py": "python", "css": "css", "scss": "scss", "vue": "vue",
+    }
+    out: list[str] = []
+
+    for fd in file_diffs:
+        label = _CHANGE_LABEL.get(fd.change_type, "已修改")
+        rename_hint = f"  (原名: {fd.old_filename})" if fd.old_filename else ""
+        out.append(f"### 文件: {fd.filename}  [{label}{rename_hint}]")
+
+        if not fd.hunks:
+            out.append("（无代码变更）\n")
+            continue
+
+        ext = fd.filename.rsplit(".", 1)[-1] if "." in fd.filename else ""
+        lang = _EXT_LANG.get(ext, "")
+
+        for i, hunk in enumerate(fd.hunks, 1):
+            out.append(f"\n#### 变更块 {i}（新文件第 {hunk.new_start} 行起）")
+            out.append(f"```{lang}")
+
+            for hl in hunk.lines:
+                if hl.kind == "added":
+                    # 新增行：行首加 [+NEW] 前缀，避免破坏 JSX/多行表达式语法
+                    out.append(f"/*[+NEW]*/ {hl.content}")
+                elif hl.kind == "removed":
+                    # 删除行：注释化，明确告知 LLM 此行已删除、不参与评审
+                    out.append(f"/*[-DEL, 不评审]*/ {hl.content.strip()}")
+                else:
+                    # 上下文行：原样输出，供 LLM 理解完整语义
+                    out.append(hl.content)
+
+            out.append("```")
+
+        out.append("")
+
+    return "\n".join(out)
+
+
 def _build_rag_context(diff_content: str, shard_index: int) -> str:
     """从 RAG 检索相关规范片段，构建上下文字符串"""
     try:
@@ -112,9 +275,14 @@ def review_single_shard(diff_content: str, pr_info: dict, settings: Settings,
 
     rag_context = _build_rag_context(diff_content, shard_index)
 
+    # 结构化渲染：将原始 diff 解析后重新渲染为 LLM 友好格式
+    # 新增代码作为主体（代码块），删除代码折叠为只读注释，从输入层面消除歧义
+    file_diffs = parse_diff_to_structured(diff_content)
+    rendered_diff = render_structured_diff(file_diffs)
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"{pr_context}{shard_hint}{rag_context}\n\n代码变更 Diff：\n\n{diff_content}"}
+        {"role": "user", "content": f"{pr_context}{shard_hint}{rag_context}\n\n代码变更：\n\n{rendered_diff}"}
     ]
 
     logger.info("🤖 LLM 分析中...\n")
@@ -126,11 +294,56 @@ def review_single_shard(diff_content: str, pr_info: dict, settings: Settings,
     if start != -1 and end != -1 and end > start:
         raw = raw[start:end + 1]
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
     except json.JSONDecodeError as e:
         logger.error("❌ LLM 返回内容无法解析为 JSON：%s", e)
         logger.debug("原始输出：\n%s", raw)
         raise ValueError("LLM 未返回有效 JSON，请重试或检查 prompt") from e
+
+    # 后处理：过滤基于推断/假设而非直接代码证据的 issue
+    result["issues"] = _filter_speculative_issues(result.get("issues", []))
+    return result
+
+
+# 纯推断性短语：这类 description 说明 LLM 在猜测而非描述可见代码的问题
+# 注意：只匹配「缺少某属性/参数/字段」这类跨文件推断，不匹配技术性的"可能为 undefined"
+_MISSING_PROP_PATTERNS = re.compile(
+    r"缺少.*属性|缺少.*字段|缺少.*参数|缺失.*属性|缺失.*参数"
+    r"|missing.*prop|missing.*field|missing.*param"
+    r"|应该(包含|有|添加).*(属性|字段|参数)"
+    r"|需要(添加|补充).*(属性|字段|参数)",
+    re.IGNORECASE,
+)
+
+
+def _filter_speculative_issues(issues: list[dict]) -> list[dict]:
+    """过滤掉没有代码直接证据的 issue。
+
+    过滤规则（按可靠性排序，只保留最精准的）：
+    1. evidence 字段为空或缺失 → 过滤（LLM 自己找不到代码证据）
+    2. description 明确是"缺少属性/字段/参数"的跨文件推断 → 过滤
+       （注意：不过滤"可能为 undefined"、"类型不安全"等技术性描述）
+    """
+    kept, dropped = [], []
+    for issue in issues:
+        evidence = (issue.get("evidence") or "").strip()
+        description = issue.get("description", "")
+
+        if not evidence:
+            # evidence 为空：LLM 无法给出直接代码证据
+            dropped.append(issue)
+            logger.debug("🗑️  过滤无证据 issue：%s", description[:80])
+        elif _MISSING_PROP_PATTERNS.search(description):
+            # 明确的跨文件属性推断：缺少某属性/字段
+            dropped.append(issue)
+            logger.debug("🗑️  过滤跨文件推断 issue：%s", description[:80])
+        else:
+            kept.append(issue)
+
+    if dropped:
+        logger.info("🔍 已过滤 %d 条无证据/推断性 issue，保留 %d 条", len(dropped), len(kept))
+
+    return kept
 
 
 def merge_review_results(results: list[dict], settings: Settings) -> dict:
