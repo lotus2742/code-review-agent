@@ -7,9 +7,13 @@ RAG 模块：规范文档向量化检索
 """
 
 import logging
+import os
 import re
 import pathlib
 from typing import Optional
+
+# 使用国内镜像加速 HuggingFace 模型下载（未设置时才设默认值，允许外部覆盖）
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import chromadb
 from chromadb.config import Settings

@@ -36,11 +36,35 @@ OPENAI_API_KEY=sk-你的key
 OPENAI_API_BASE=https://api.openai.com/v1
 OPENAI_MODEL=gpt-4o
 
+# 模型上下文窗口大小（可选，单位：tokens）
+# MODEL_CONTEXT_TOKENS=128000
+
 # GitHub Token（可选，不填则只读模式，无法发回 PR 评论）
 GITHUB_TOKEN=ghp_你的token
 ```
 
 > `GITHUB_TOKEN` 需要有 `repo` 权限，在 GitHub → Settings → Developer settings → Personal access tokens 生成。
+
+#### MODEL_CONTEXT_TOKENS 说明
+
+以下模型**无需填写**此项，程序会自动识别其上下文窗口大小：
+
+| 模型系列 | 自动识别的关键词 | 推断上下文大小 |
+|----------|----------------|---------------|
+| 通义千问 | `qwen-turbo`、`qwen-plus`、`qwen-max` | 128K |
+| OpenAI | `gpt-4o`、`gpt-4-turbo` | 128K |
+| OpenAI | `gpt-4-32k` | 32K |
+| OpenAI | `gpt-3.5-turbo-16k` | 16K |
+| Anthropic | `claude-3`（含 claude-3.5 等） | 128K |
+| DeepSeek | `deepseek`（含所有版本） | 128K |
+| Google | `gemini`（含所有版本） | 128K |
+
+使用**不在上表中**的模型（如 `qwen-long`、`llama3`、私有部署模型等）时，建议在 `.env` 中手动指定，否则默认保守使用 8K，可能导致大 PR 被分片过多：
+
+```env
+# 示例：qwen-long 支持 100 万 token
+MODEL_CONTEXT_TOKENS=1000000
+```
 
 ### 3. 建立规范索引（可选，开启 RAG）
 
@@ -135,4 +159,4 @@ jobs:
 
 - `.env` 文件包含敏感信息，已在 `.gitignore` 中排除，**请勿提交到 git**
 - 公开仓库无需 `GITHUB_TOKEN` 即可拉取 PR diff；私有仓库必须配置
-- diff 超过 15000 字符时会按文件边界截断，并在报告末尾列出跳过的文件名
+- diff 超出模型上下文限制时会**自动按文件粒度分片**，逐片 review 后合并结果，不再丢弃任何文件

@@ -16,6 +16,10 @@ inputs:
   openai_model:
     description: "使用的模型名称，如 gpt-4o、qwen-turbo"
     required: true
+  model_context_tokens:
+    description: "模型上下文窗口大小（tokens，可选）。使用 qwen-turbo/gpt-4o/claude-3/deepseek/gemini 等主流模型时无需填写，程序会自动识别；使用其他模型时建议填写，否则默认 8K"
+    required: false
+    default: ""
   github_token:
     description: "GitHub Token，用于发回 PR 评论（需要 pull-requests: write 权限）"
     required: true
@@ -58,7 +62,9 @@ runs:
         OPENAI_API_KEY: ${{ inputs.openai_api_key }}
         OPENAI_API_BASE: ${{ inputs.openai_api_base }}
         OPENAI_MODEL: ${{ inputs.openai_model }}
+        MODEL_CONTEXT_TOKENS: ${{ inputs.model_context_tokens }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
+        HF_ENDPOINT: "https://hf-mirror.com"
 
     - name: Run AI Code Review
       shell: bash
@@ -67,5 +73,6 @@ runs:
         OPENAI_API_KEY: ${{ inputs.openai_api_key }}
         OPENAI_API_BASE: ${{ inputs.openai_api_base }}
         OPENAI_MODEL: ${{ inputs.openai_model }}
+        MODEL_CONTEXT_TOKENS: ${{ inputs.model_context_tokens }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
 
